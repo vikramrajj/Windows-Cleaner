@@ -6,7 +6,8 @@ visualizer (TreeSize-style), and a CLI for automation and reporting.
 
 ## Features
 
-- Targeted cache cleaning: Teams classic/new, Outlook Secure Temp, Windows temp, user temp.
+- Targeted cache cleaning: Teams classic/new, Outlook Secure Temp, Office document cache, Windows temp, user temp.
+- Windows Update residuals and Delivery Optimization cache cleanup (admin required).
 - Full drive scan to surface large folders, with configurable size threshold.
 - Tree Map visualization with click-to-zoom and Back navigation.
 - Safe vs. Review guardrails to prevent accidental deletion of system/index data.
@@ -42,6 +43,7 @@ python cleaner.py scan [--full] [--aggressive] [--json] [--save-report PATH] [--
 python cleaner.py clean --confirm [--category temp_user --category teams_classic_cache]
 python cleaner.py clean --confirm --dangerous
 python cleaner.py clean --confirm --dry-run --use-last-scan
+python cleaner.py clean --confirm --one-click
 python cleaner.py report --path C:\temp\cleaner-report.txt [--full] [--aggressive]
 python cleaner.py gui
 ```
@@ -52,11 +54,22 @@ python cleaner.py gui
 - REVIEW categories (like Windows Search index data) are blocked unless you pass `--dangerous`.
 - The cleaner only removes contents of folders, not the folders themselves.
 
+## One-click cleanup
+
+Use the one-click option to clean temp files plus Teams/Outlook/Office caches and Windows Update residuals in one pass.
+
+```powershell
+python cleaner.py clean --confirm --one-click
+```
+
+Run as Administrator to include Windows Update and Delivery Optimization caches.
+
 ## Notes
 
 - Full scans can be slow. By default, system folders are skipped unless you use `--aggressive`.
 - Some files may be locked by running apps and will be reported as failures.
 - The Tree Map tab provides a visual overview similar to TreeSize, with zoomable rectangles.
+- One-click cleanup will skip Windows Update/Delivery Optimization caches unless you run as admin.
 
 ## App data
 

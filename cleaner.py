@@ -7,7 +7,7 @@ import shutil
 import sys
 import threading
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from datetime import datetime
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -26,6 +26,8 @@ class ScanItem:
     file_count: int
     safe_to_delete: bool
     reason: str
+    requires_admin: bool = False
+    services_to_stop: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -42,6 +44,30 @@ SAFE_DELETE_CATEGORIES = {
     "teams_classic_cache",
     "teams_new_cache",
     "outlook_secure_temp",
+    "office_document_cache",
+    "windows_update_cache",
+    "delivery_optimization_cache",
+}
+
+ADMIN_REQUIRED_CATEGORIES = {
+    "windows_update_cache",
+    "delivery_optimization_cache",
+}
+
+SERVICE_DEPENDENCIES = {
+    "windows_update_cache": ["wuauserv", "bits"],
+    "delivery_optimization_cache": ["dosvc"],
+}
+
+ONE_CLICK_CATEGORIES = {
+    "temp_system",
+    "temp_user",
+    "teams_classic_cache",
+    "teams_new_cache",
+    "outlook_secure_temp",
+    "office_document_cache",
+    "windows_update_cache",
+    "delivery_optimization_cache",
 }
 
 
@@ -101,6 +127,48 @@ def save_config(config: Dict[str, object]) -> None:
             json.dump(config, handle, indent=2)
     except Exception:
         return
+
+
+def is_admin() -> bool:
+    try:
+        import ctypes
+
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def service_is_running(name: str) -> bool:
+    try:
+        result = subprocess_run(["sc", "query", name])
+        output = (result or "").upper()
+        return "RUNNING" in output
+    except Exception:
+        return False
+
+
+def stop_services(services: List[str]) -> List[str]:
+    stopped = []
+    for service in services:
+        if service_is_running(service):
+            subprocess_run(["sc", "stop", service])
+            stopped.append(service)
+    return stopped
+
+
+def start_services(services: List[str]) -> None:
+    for service in services:
+        subprocess_run(["sc", "start", service])
+
+
+def subprocess_run(command: List[str]) -> str:
+    try:
+        import subprocess
+
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        return (result.stdout or "") + (result.stderr or "")
+    except Exception:
+        return ""
 
 
 def human_bytes(value: int) -> str:
@@ -399,6 +467,30 @@ def resolve_rule_paths() -> Dict[str, List[Tuple[str, str, str]]]:
             )
         ],
         "outlook_secure_temp": [],
+        "office_document_cache": [],
+        "windows_update_cache": [
+            (
+                "Windows Update Download Cache",
+                os.path.join(system_root, "SoftwareDistribution", "Download"),
+                "Downloaded Windows Update payloads.",
+            )
+        ],
+        "delivery_optimization_cache": [
+            (
+                "Delivery Optimization Cache",
+                os.path.join(
+                    system_root,
+                    "ServiceProfiles",
+                    "NetworkService",
+                    "AppData",
+                    "Local",
+                    "Microsoft",
+                    "DeliveryOptimization",
+                    "Cache",
+                ),
+                "Delivery Optimization cache (downloaded update content).",
+            )
+        ],
         "windows_search_index": [
             (
                 "Windows Search Index",
@@ -411,6 +503,18 @@ def resolve_rule_paths() -> Dict[str, List[Tuple[str, str, str]]]:
     for path in get_outlook_secure_temp_paths():
         rules["outlook_secure_temp"].append(
             ("Outlook Secure Temp", path, "Outlook attachment temp cache.")
+        )
+
+    for version in ["16.0", "15.0"]:
+        cache_path = os.path.join(
+            local_app, "Microsoft", "Office", version, "OfficeFileCache"
+        )
+        rules["office_document_cache"].append(
+            (
+                f"Office Document Cache {version}",
+                cache_path,
+                "Office document cache (OneDrive/SharePoint sync).",
+            )
         )
 
     return rules
@@ -429,6 +533,8 @@ def scan_rules() -> List[ScanItem]:
                 size, count = dir_size(path)
             else:
                 size, count = file_size(path)
+            requires_admin = category in ADMIN_REQUIRED_CATEGORIES
+            services = SERVICE_DEPENDENCIES.get(category, [])
             items.append(
                 ScanItem(
                     category=category,
@@ -438,6 +544,8 @@ def scan_rules() -> List[ScanItem]:
                     file_count=count,
                     safe_to_delete=category in SAFE_DELETE_CATEGORIES,
                     reason=reason,
+                    requires_admin=requires_admin,
+                    services_to_stop=services,
                 )
             )
     return items
@@ -493,8 +601,10 @@ def format_report(items: List[ScanItem]) -> str:
     lines.append("")
     for item in sorted(items, key=lambda i: i.size_bytes, reverse=True):
         safe_marker = "SAFE" if item.safe_to_delete else "REVIEW"
+        admin_marker = "ADMIN" if item.requires_admin else ""
+        marker = "|".join([m for m in [safe_marker, admin_marker] if m])
         lines.append(
-            f"[{safe_marker}] {item.label} | {human_bytes(item.size_bytes)} | "
+            f"[{marker}] {item.label} | {human_bytes(item.size_bytes)} | "
             f"{item.file_count} files | {item.path}"
         )
     return "\n".join(lines)
@@ -541,7 +651,11 @@ def clean_items(
     deleted_bytes = 0
     deleted_files = 0
     failures: List[str] = []
+    admin = is_admin()
     for item in items:
+        if item.requires_admin and not admin:
+            failures.append(f"{item.path} (blocked: admin required)")
+            continue
         if not item.safe_to_delete and not allow_dangerous:
             failures.append(f"{item.path} (blocked: review required)")
             continue
@@ -550,6 +664,34 @@ def clean_items(
         deleted_files += df
         failures.extend(errs)
     return deleted_bytes, deleted_files, failures
+
+
+def one_click_clean(items: List[ScanItem]) -> Tuple[int, int, List[str], List[str]]:
+    skipped: List[str] = []
+    candidates = [item for item in items if item.category in ONE_CLICK_CATEGORIES]
+    admin = is_admin()
+
+    services = []
+    for item in candidates:
+        if item.requires_admin and not admin:
+            skipped.append(f"{item.label} (admin required)")
+            continue
+        services.extend(item.services_to_stop)
+
+    services = list(dict.fromkeys(services))
+    stopped = stop_services(services) if admin and services else []
+
+    cleanable = [
+        item
+        for item in candidates
+        if (not item.requires_admin) or (item.requires_admin and admin)
+    ]
+    deleted_bytes, deleted_files, failures = clean_items(cleanable)
+
+    if stopped:
+        start_services(stopped)
+
+    return deleted_bytes, deleted_files, failures, skipped
 
 
 def save_scan_cache(items: List[ScanItem]) -> None:
@@ -578,26 +720,74 @@ def launch_gui() -> None:
 
     root = tk.Tk()
     root.title("C Drive Cleaner")
-    root.geometry("980x640")
+    root.geometry("1100x720")
+    root.configure(bg="#f6f7fb")
 
     config = load_config()
     items: List[ScanItem] = load_scan_cache()
     progress_queue: "queue.Queue" = queue.Queue()
 
-    header = tk.Label(
-        root,
-        text="C Drive Cleaner",
-        font=("Segoe UI", 16, "bold"),
+    style = ttk.Style()
+    style.theme_use("clam")
+
+    brand_bg = "#0f172a"
+    brand_fg = "#f8fafc"
+    accent = "#f97316"
+    text_primary = "#0f172a"
+    text_muted = "#64748b"
+    panel_bg = "#ffffff"
+    border = "#e2e8f0"
+
+    style.configure("TFrame", background=panel_bg)
+    style.configure("TLabel", background=panel_bg, foreground=text_primary, font=("Segoe UI", 10))
+    style.configure("Muted.TLabel", background=panel_bg, foreground=text_muted, font=("Segoe UI", 9))
+    style.configure("Title.TLabel", background=brand_bg, foreground=brand_fg, font=("Segoe UI Semibold", 18))
+    style.configure("Subtitle.TLabel", background=brand_bg, foreground="#cbd5f5", font=("Segoe UI", 10))
+    style.configure("TButton", font=("Segoe UI Semibold", 10), padding=(10, 6))
+    style.map("TButton", background=[("active", "#f1f5f9")])
+    style.configure("Primary.TButton", background=accent, foreground="#ffffff")
+    style.map("Primary.TButton", background=[("active", "#ea580c")])
+    style.configure("TNotebook", background=panel_bg, borderwidth=0)
+    style.configure("TNotebook.Tab", padding=(16, 8), font=("Segoe UI Semibold", 10))
+    style.map("TNotebook.Tab", background=[("selected", panel_bg)], foreground=[("selected", text_primary)])
+    style.configure(
+        "Treeview",
+        font=("Segoe UI", 10),
+        rowheight=28,
+        background=panel_bg,
+        fieldbackground=panel_bg,
+        bordercolor=border,
     )
-    header.pack(pady=6)
+    style.configure("Treeview.Heading", font=("Segoe UI Semibold", 10), background="#f1f5f9")
+
+    header_frame = tk.Frame(root, bg=brand_bg, height=86)
+    header_frame.pack(fill=tk.X, pady=(0, 8))
+    header_frame.pack_propagate(False)
+
+    header_left = tk.Frame(header_frame, bg=brand_bg)
+    header_left.pack(side=tk.LEFT, padx=20, pady=16)
+    tk.Label(
+        header_left,
+        text="C Drive Cleaner",
+        font=("Segoe UI Semibold", 20),
+        fg=brand_fg,
+        bg=brand_bg,
+    ).pack(anchor="w")
+    tk.Label(
+        header_left,
+        text="Minimal, safe, and fast cleanup for Windows",
+        font=("Segoe UI", 10),
+        fg="#cbd5f5",
+        bg=brand_bg,
+    ).pack(anchor="w")
 
     notebook = ttk.Notebook(root)
-    notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=6)
+    notebook.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 12))
 
-    scanner_tab = tk.Frame(notebook)
-    results_tab = tk.Frame(notebook)
-    settings_tab = tk.Frame(notebook)
-    treemap_tab = tk.Frame(notebook)
+    scanner_tab = ttk.Frame(notebook)
+    results_tab = ttk.Frame(notebook)
+    settings_tab = ttk.Frame(notebook)
+    treemap_tab = ttk.Frame(notebook)
 
     notebook.add(scanner_tab, text="Scanner")
     notebook.add(results_tab, text="Results")
@@ -609,39 +799,41 @@ def launch_gui() -> None:
     treemap_summary_var = tk.StringVar(value="Run a tree scan to visualize disk usage.")
     treemap_progress_var = tk.StringVar(value="")
 
-    scanner_header = tk.Label(
+    scanner_header = ttk.Label(
         scanner_tab,
-        text="Run a scan and review results before cleaning.",
-        font=("Segoe UI", 10),
+        text="Scan your drive and review results before cleaning.",
+        style="Muted.TLabel",
     )
-    scanner_header.pack(anchor="w", padx=8, pady=4)
+    scanner_header.pack(anchor="w", padx=16, pady=(16, 6))
 
     full_scan_var = tk.BooleanVar(value=False)
     aggressive_var = tk.BooleanVar(value=bool(config.get("aggressive_full_scan")))
     min_mb_var = tk.StringVar(value=str(config.get("min_full_scan_mb", 100)))
 
-    options_frame = tk.Frame(scanner_tab)
-    options_frame.pack(fill=tk.X, padx=8, pady=6)
+    options_frame = ttk.Frame(scanner_tab)
+    options_frame.pack(fill=tk.X, padx=16, pady=6)
     tk.Checkbutton(
         options_frame,
         text="Include full drive scan (slow)",
         variable=full_scan_var,
+        bg=panel_bg,
     ).pack(side=tk.LEFT)
     tk.Checkbutton(
         options_frame,
         text="Aggressive full scan (includes system folders)",
         variable=aggressive_var,
+        bg=panel_bg,
     ).pack(side=tk.LEFT, padx=12)
-    tk.Label(options_frame, text="Min size (MB):").pack(side=tk.LEFT, padx=8)
+    ttk.Label(options_frame, text="Min size (MB):").pack(side=tk.LEFT, padx=(12, 6))
     tk.Entry(options_frame, textvariable=min_mb_var, width=6).pack(side=tk.LEFT)
 
-    status_frame = tk.Frame(scanner_tab)
-    status_frame.pack(fill=tk.X, padx=8, pady=4)
-    tk.Label(status_frame, textvariable=summary_var).pack(anchor="w")
-    tk.Label(status_frame, textvariable=progress_var, fg="#555").pack(anchor="w")
+    status_frame = ttk.Frame(scanner_tab)
+    status_frame.pack(fill=tk.X, padx=16, pady=(0, 10))
+    ttk.Label(status_frame, textvariable=summary_var).pack(anchor="w")
+    ttk.Label(status_frame, textvariable=progress_var, style="Muted.TLabel").pack(anchor="w")
 
     columns = ("category", "size", "files", "path", "safe")
-    tree = ttk.Treeview(results_tab, columns=columns, show="headings", height=16)
+    tree = ttk.Treeview(results_tab, columns=columns, show="headings", height=18)
     tree.heading("category", text="Category")
     tree.heading("size", text="Size")
     tree.heading("files", text="Files")
@@ -652,64 +844,63 @@ def launch_gui() -> None:
     tree.column("files", width=70, anchor=tk.E)
     tree.column("path", width=520)
     tree.column("safe", width=90)
-    tree.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+    tree.pack(fill=tk.BOTH, expand=True, padx=16, pady=12)
 
-    settings_label = tk.Label(
+    settings_label = ttk.Label(
         settings_tab,
         text="Folders to skip during full scan (one per line):",
-        font=("Segoe UI", 10),
+        style="Muted.TLabel",
     )
-    settings_label.pack(anchor="w", padx=8, pady=4)
+    settings_label.pack(anchor="w", padx=16, pady=(16, 6))
     skip_text = tk.Text(settings_tab, height=10)
-    skip_text.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
+    skip_text.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 12))
     skip_text.insert("1.0", "\n".join(config.get("skip_dirs", DEFAULT_SKIP_DIRS)))
 
-    treemap_header = tk.Label(
+    treemap_header = ttk.Label(
         treemap_tab,
         text="Tree Map View (beginner friendly): scan a drive and click rectangles to drill down.",
-        font=("Segoe UI", 10),
+        style="Muted.TLabel",
     )
-    treemap_header.pack(anchor="w", padx=8, pady=4)
+    treemap_header.pack(anchor="w", padx=16, pady=(16, 6))
 
-    treemap_controls = tk.Frame(treemap_tab)
-    treemap_controls.pack(fill=tk.X, padx=8, pady=4)
-    tk.Label(treemap_controls, text="Root path:").pack(side=tk.LEFT)
+    treemap_controls = ttk.Frame(treemap_tab)
+    treemap_controls.pack(fill=tk.X, padx=16, pady=4)
+    ttk.Label(treemap_controls, text="Root path:").pack(side=tk.LEFT)
     treemap_root_var = tk.StringVar(value="C:\\")
     tk.Entry(treemap_controls, textvariable=treemap_root_var, width=12).pack(
         side=tk.LEFT, padx=6
     )
-    tk.Label(treemap_controls, text="Max depth:").pack(side=tk.LEFT)
+    ttk.Label(treemap_controls, text="Max depth:").pack(side=tk.LEFT)
     treemap_depth_var = tk.StringVar(value="2")
     tk.Entry(treemap_controls, textvariable=treemap_depth_var, width=4).pack(
         side=tk.LEFT, padx=6
     )
-    tk.Label(treemap_controls, text="Min size (MB):").pack(side=tk.LEFT)
+    ttk.Label(treemap_controls, text="Min size (MB):").pack(side=tk.LEFT)
     treemap_min_var = tk.StringVar(value="50")
     tk.Entry(treemap_controls, textvariable=treemap_min_var, width=6).pack(
         side=tk.LEFT, padx=6
     )
-    treemap_scan_button = tk.Button(treemap_controls, text="Scan")
+    treemap_scan_button = ttk.Button(treemap_controls, text="Scan")
     treemap_scan_button.pack(side=tk.LEFT, padx=6)
-    treemap_back_button = tk.Button(treemap_controls, text="Back", state=tk.DISABLED)
+    treemap_back_button = ttk.Button(treemap_controls, text="Back", state=tk.DISABLED)
     treemap_back_button.pack(side=tk.LEFT)
 
-    treemap_status = tk.Frame(treemap_tab)
-    treemap_status.pack(fill=tk.X, padx=8, pady=4)
-    tk.Label(treemap_status, textvariable=treemap_summary_var).pack(anchor="w")
-    tk.Label(treemap_status, textvariable=treemap_progress_var, fg="#555").pack(
+    treemap_status = ttk.Frame(treemap_tab)
+    treemap_status.pack(fill=tk.X, padx=16, pady=4)
+    ttk.Label(treemap_status, textvariable=treemap_summary_var).pack(anchor="w")
+    ttk.Label(treemap_status, textvariable=treemap_progress_var, style="Muted.TLabel").pack(
         anchor="w"
     )
 
-    treemap_canvas = tk.Canvas(treemap_tab, background="#f7f7f7", highlightthickness=0)
-    treemap_canvas.pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
+    treemap_canvas = tk.Canvas(treemap_tab, background="#f8fafc", highlightthickness=0)
+    treemap_canvas.pack(fill=tk.BOTH, expand=True, padx=16, pady=10)
 
-    treemap_legend = tk.Label(
+    treemap_legend = ttk.Label(
         treemap_tab,
         text="Tip: click a rectangle to zoom in; use Back to go up.",
-        font=("Segoe UI", 9),
-        fg="#555",
+        style="Muted.TLabel",
     )
-    treemap_legend.pack(anchor="w", padx=8, pady=(0, 6))
+    treemap_legend.pack(anchor="w", padx=16, pady=(0, 12))
 
     treemap_root: Optional[TreeNode] = None
     treemap_stack: List[TreeNode] = []
@@ -799,6 +990,29 @@ def launch_gui() -> None:
             )
             progress_var.set("")
             log_event("Scan completed")
+            refresh_view()
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def run_one_click() -> None:
+        def worker() -> None:
+            nonlocal items
+            ok = messagebox.askyesno(
+                "One Click Clean",
+                "Clean Windows Update, Delivery Optimization, Office/Outlook/Teams caches, and temp files?",
+            )
+            if not ok:
+                return
+            summary_var.set("Running one-click cleanup...")
+            progress_var.set("")
+            items = scan_rules()
+            deleted_bytes, deleted_files, failures, skipped = one_click_clean(items)
+            summary = f"One-click cleanup removed {deleted_files} items ({human_bytes(deleted_bytes)})."
+            if skipped:
+                summary += "\nSome items require admin rights."
+            if failures:
+                summary += "\nSome items could not be removed."
+            messagebox.showinfo("One Click Clean", summary)
             refresh_view()
 
         threading.Thread(target=worker, daemon=True).start()
@@ -964,25 +1178,33 @@ def launch_gui() -> None:
         save_config(config_update)
         messagebox.showinfo("Cleaner", "Settings saved.")
 
-    scanner_buttons = tk.Frame(scanner_tab)
-    scanner_buttons.pack(fill=tk.X, padx=8, pady=8)
-    tk.Button(scanner_buttons, text="Scan Now", command=run_scan_in_background).pack(
-        side=tk.LEFT
-    )
-    tk.Button(scanner_buttons, text="Save Settings", command=save_settings).pack(
+    scanner_buttons = ttk.Frame(scanner_tab)
+    scanner_buttons.pack(fill=tk.X, padx=16, pady=12)
+    ttk.Button(
+        scanner_buttons,
+        text="Scan Now",
+        command=run_scan_in_background,
+        style="Primary.TButton",
+    ).pack(side=tk.LEFT)
+    ttk.Button(
+        scanner_buttons,
+        text="One Click Clean",
+        command=run_one_click,
+    ).pack(side=tk.LEFT, padx=8)
+    ttk.Button(scanner_buttons, text="Save Settings", command=save_settings).pack(
         side=tk.LEFT, padx=8
     )
-    tk.Button(scanner_buttons, text="Exit", command=root.destroy).pack(side=tk.RIGHT)
+    ttk.Button(scanner_buttons, text="Exit", command=root.destroy).pack(side=tk.RIGHT)
 
-    results_buttons = tk.Frame(results_tab)
-    results_buttons.pack(fill=tk.X, padx=8, pady=8)
-    tk.Button(results_buttons, text="Open Folder", command=open_selected_path).pack(
+    results_buttons = ttk.Frame(results_tab)
+    results_buttons.pack(fill=tk.X, padx=16, pady=12)
+    ttk.Button(results_buttons, text="Open Folder", command=open_selected_path).pack(
         side=tk.LEFT
     )
-    tk.Button(results_buttons, text="Export Report", command=export_report).pack(
+    ttk.Button(results_buttons, text="Export Report", command=export_report).pack(
         side=tk.LEFT, padx=8
     )
-    tk.Button(results_buttons, text="Clean Selected", command=clean_selected).pack(
+    ttk.Button(results_buttons, text="Clean Selected", command=clean_selected, style="Primary.TButton").pack(
         side=tk.RIGHT
     )
 
@@ -1051,6 +1273,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--dangerous",
         action="store_true",
         help="Allow cleaning review-only items.",
+    )
+    clean_cmd.add_argument(
+        "--one-click",
+        action="store_true",
+        help="Run the one-click cleanup set.",
     )
     clean_cmd.add_argument(
         "--dry-run",
@@ -1126,6 +1353,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         if not args.confirm:
             print("Refusing to delete without --confirm.")
             return 2
+        if args.one_click:
+            deleted_bytes, deleted_files, failures, skipped = one_click_clean(items)
+            print(
+                f"One-click cleanup removed {deleted_files} entries totaling {human_bytes(deleted_bytes)}."
+            )
+            if skipped:
+                print("Skipped (admin required):")
+                for item in skipped:
+                    print(f"- {item}")
+            if failures:
+                print("Failures:")
+                for fail in failures:
+                    print(f"- {fail}")
+            return 0
         if args.category:
             items = [item for item in items if item.category in args.category]
         if args.dry_run:
