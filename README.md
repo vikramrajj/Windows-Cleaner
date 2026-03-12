@@ -22,6 +22,11 @@ visualizer (TreeSize-style), and a CLI for automation and reporting.
 - Settings tab: skip list and scan thresholds.
 - Tree Map tab: visual breakdown by size with drill-down navigation.
 
+## Screenshots
+
+![Scanner](assets/screenshots/scanner.png)
+![Tree Map](assets/screenshots/treemap.png)
+
 ## Quick start
 
 ```powershell

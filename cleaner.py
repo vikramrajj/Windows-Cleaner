@@ -714,15 +714,16 @@ def launch_gui() -> None:
     treemap_root: Optional[TreeNode] = None
     treemap_stack: List[TreeNode] = []
     treemap_rects: List[Tuple[int, TreeNode]] = []
+    tree_item_map: Dict[str, ScanItem] = {}
 
     def refresh_view() -> None:
         tree.delete(*tree.get_children())
+        tree_item_map.clear()
         for item in items:
             safety = "SAFE" if item.safe_to_delete else "REVIEW"
-            tree.insert(
+            tree_id = tree.insert(
                 "",
                 tk.END,
-                iid=item.path,
                 values=(
                     item.label,
                     human_bytes(item.size_bytes),
@@ -731,6 +732,7 @@ def launch_gui() -> None:
                     safety,
                 ),
             )
+            tree_item_map[tree_id] = item
 
     def export_report() -> None:
         from tkinter import filedialog
@@ -755,7 +757,10 @@ def launch_gui() -> None:
         if not selected:
             messagebox.showinfo("Cleaner", "Select an item first.")
             return
-        path = selected[0]
+        item = tree_item_map.get(selected[0])
+        if not item:
+            return
+        path = item.path
         try:
             os.startfile(path)
         except Exception as exc:
@@ -917,7 +922,7 @@ def launch_gui() -> None:
         if not selected:
             messagebox.showinfo("Cleaner", "Select at least one item.")
             return
-        chosen = [item for item in items if item.path in selected]
+        chosen = [tree_item_map[item_id] for item_id in selected if item_id in tree_item_map]
         blocked = [item for item in chosen if not item.safe_to_delete]
         if blocked:
             messagebox.showwarning(
@@ -980,6 +985,16 @@ def launch_gui() -> None:
     tk.Button(results_buttons, text="Clean Selected", command=clean_selected).pack(
         side=tk.RIGHT
     )
+
+    start_tab = os.environ.get("CLEANER_START_TAB", "").strip().lower()
+    if start_tab == "results":
+        notebook.select(results_tab)
+    elif start_tab == "settings":
+        notebook.select(settings_tab)
+    elif start_tab in {"treemap", "tree", "tree map"}:
+        notebook.select(treemap_tab)
+    else:
+        notebook.select(scanner_tab)
 
     summary_var.set(
         f"Loaded last scan: {len(items)} targets, {human_bytes(sum(i.size_bytes for i in items))} total."
