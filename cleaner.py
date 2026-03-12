@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 import argparse
+import base64
 import csv
 import getpass
+import hashlib
+import hmac
 import json
 import os
 import platform
@@ -13,6 +16,7 @@ import time
 import uuid
 from dataclasses import dataclass, asdict, field
 from datetime import datetime
+from email.utils import formatdate
 from typing import Dict, Iterable, List, Optional, Tuple
 
 try:
@@ -122,6 +126,30 @@ BUILTIN_PROFILES: Dict[str, Dict[str, object]] = {
     },
 }
 
+KNOWN_CATEGORIES = [
+    "temp_system",
+    "temp_user",
+    "teams_classic_cache",
+    "teams_new_cache",
+    "outlook_secure_temp",
+    "office_document_cache",
+    "windows_update_cache",
+    "delivery_optimization_cache",
+    "windows_search_index",
+]
+
+CATEGORY_LABELS = {
+    "temp_system": "Windows Temp",
+    "temp_user": "User Temp",
+    "teams_classic_cache": "Teams (Classic) Cache",
+    "teams_new_cache": "Teams (New) Cache",
+    "outlook_secure_temp": "Outlook Secure Temp",
+    "office_document_cache": "Office Document Cache",
+    "windows_update_cache": "Windows Update Download Cache",
+    "delivery_optimization_cache": "Delivery Optimization Cache",
+    "windows_search_index": "Windows Search Index",
+}
+
 
 DEFAULT_SKIP_DIRS = [
     "C:\\Windows",
@@ -166,6 +194,11 @@ def load_config() -> Dict[str, object]:
         "audit_enabled": True,
         "audit_sink_path": "",
         "audit_http_endpoint": "",
+        "sentinel_enabled": False,
+        "sentinel_workspace_id": "",
+        "sentinel_shared_key": "",
+        "sentinel_log_type": "CDriveCleanerAudit",
+        "sentinel_time_field": "timestamp",
     }
     try:
         with open(config_path(), "r", encoding="utf-8") as handle:
@@ -193,6 +226,17 @@ def load_profiles() -> Dict[str, Dict[str, object]]:
         except Exception:
             pass
     return profiles
+
+
+def save_profiles(profiles: Dict[str, Dict[str, object]]) -> None:
+    custom_path = os.environ.get("CLEANER_PROFILES_PATH", "")
+    if not custom_path:
+        custom_path = os.path.join(app_data_dir(), "profiles.json")
+    try:
+        with open(custom_path, "w", encoding="utf-8") as handle:
+            json.dump(profiles, handle, indent=2)
+    except Exception:
+        return
 
 
 def get_profile(name: str, profiles: Dict[str, Dict[str, object]]) -> Dict[str, object]:
@@ -340,11 +384,37 @@ def get_audit_config(
         config.get("audit_http_endpoint", "")
     )
     enabled = bool(config.get("audit_enabled", True))
+    sentinel_enabled = bool(config.get("sentinel_enabled", False))
+    workspace_id = os.environ.get("CLEANER_SENTINEL_WORKSPACE") or str(
+        config.get("sentinel_workspace_id", "")
+    )
+    shared_key = os.environ.get("CLEANER_SENTINEL_KEY") or str(
+        config.get("sentinel_shared_key", "")
+    )
+    log_type = os.environ.get("CLEANER_SENTINEL_LOG_TYPE") or str(
+        config.get("sentinel_log_type", "CDriveCleanerAudit")
+    )
+    time_field = os.environ.get("CLEANER_SENTINEL_TIME_FIELD") or str(
+        config.get("sentinel_time_field", "timestamp")
+    )
     if overrides:
         sink = overrides.get("sink", sink) or sink
         endpoint = overrides.get("endpoint", endpoint) or endpoint
-        enabled = overrides.get("enabled", enabled) if overrides.get("enabled") is not None else enabled
-    return {"sink": sink, "endpoint": endpoint, "enabled": enabled}
+        enabled = (
+            overrides.get("enabled", enabled)
+            if overrides.get("enabled") is not None
+            else enabled
+        )
+    return {
+        "sink": sink,
+        "endpoint": endpoint,
+        "enabled": enabled,
+        "sentinel_enabled": sentinel_enabled,
+        "workspace_id": workspace_id,
+        "shared_key": shared_key,
+        "log_type": log_type,
+        "time_field": time_field,
+    }
 
 
 def build_audit_event(
@@ -449,6 +519,64 @@ def emit_audit_event(
         sink=audit_config.get("sink") or "",
         endpoint=audit_config.get("endpoint") or "",
     )
+    if (
+        audit_config.get("sentinel_enabled")
+        and audit_config.get("workspace_id")
+        and audit_config.get("shared_key")
+    ):
+        send_to_log_analytics(
+            event,
+            workspace_id=str(audit_config.get("workspace_id")),
+            shared_key=str(audit_config.get("shared_key")),
+            log_type=str(audit_config.get("log_type", "CDriveCleanerAudit")),
+            time_field=str(audit_config.get("time_field", "timestamp")),
+        )
+
+
+def sanitize_log_type(value: str) -> str:
+    cleaned = "".join(ch for ch in value if ch.isalpha())
+    return cleaned or "CDriveCleanerAudit"
+
+
+def send_to_log_analytics(
+    event: Dict[str, object],
+    workspace_id: str,
+    shared_key: str,
+    log_type: str,
+    time_field: str = "timestamp",
+) -> None:
+    body = json.dumps(event).encode("utf-8")
+    method = "POST"
+    content_type = "application/json"
+    resource = "/api/logs"
+    rfc1123_date = formatdate(usegmt=True)
+    string_to_sign = (
+        f"{method}\n{len(body)}\n{content_type}\n"
+        f"x-ms-date:{rfc1123_date}\n{resource}"
+    )
+    decoded_key = base64.b64decode(shared_key)
+    signature = base64.b64encode(
+        hmac.new(decoded_key, string_to_sign.encode("utf-8"), hashlib.sha256).digest()
+    ).decode("utf-8")
+    authorization = f"SharedKey {workspace_id}:{signature}"
+
+    uri = f"https://{workspace_id}.ods.opinsights.azure.com{resource}?api-version=2016-04-01"
+    headers = {
+        "Content-Type": content_type,
+        "Authorization": authorization,
+        "Log-Type": sanitize_log_type(log_type),
+        "x-ms-date": rfc1123_date,
+    }
+    if time_field:
+        headers["time-generated-field"] = time_field
+
+    try:
+        import urllib.request
+
+        req = urllib.request.Request(uri, data=body, headers=headers, method="POST")
+        urllib.request.urlopen(req, timeout=10)
+    except Exception as exc:
+        log_event(f"Sentinel export failed: {exc}")
 
 
 def human_bytes(value: int) -> str:
@@ -1148,6 +1276,63 @@ def launch_gui() -> None:
 
     profile_combo.bind("<<ComboboxSelected>>", on_profile_change)
 
+    def refresh_profile_selectors() -> None:
+        current_profiles = sorted(profiles.keys())
+        profile_combo["values"] = current_profiles
+        profile_select_combo["values"] = current_profiles
+        schedule_profile_combo["values"] = current_profiles
+        if profile_var.get() not in current_profiles and current_profiles:
+            profile_var.set(current_profiles[0])
+        if profile_select_combo.get() not in current_profiles and current_profiles:
+            profile_select_combo.set(current_profiles[0])
+        if schedule_profile_var.get() not in current_profiles and current_profiles:
+            schedule_profile_var.set(current_profiles[0])
+
+    def load_profile_into_editor(name: str) -> None:
+        profile = get_profile(name, profiles)
+        profile_edit_name_var.set(name)
+        profile_edit_label_var.set(str(profile.get("label", "")))
+        profile_edit_desc_var.set(str(profile.get("description", "")))
+        profile_edit_danger_var.set(bool(profile.get("allow_dangerous", False)))
+        category_list.selection_clear(0, tk.END)
+        categories = set(profile_categories(profile))
+        for idx, cat in enumerate(KNOWN_CATEGORIES):
+            if cat in categories:
+                category_list.selection_set(idx)
+
+    def new_profile_editor() -> None:
+        profile_edit_name_var.set("")
+        profile_edit_label_var.set("")
+        profile_edit_desc_var.set("")
+        profile_edit_danger_var.set(False)
+        category_list.selection_clear(0, tk.END)
+
+    def save_profile_editor() -> None:
+        name = profile_edit_name_var.get().strip()
+        if not name:
+            messagebox.showinfo("Profile Editor", "Profile name is required.")
+            return
+        selected = [KNOWN_CATEGORIES[i] for i in category_list.curselection()]
+        profiles[name] = {
+            "label": profile_edit_label_var.get().strip() or name,
+            "description": profile_edit_desc_var.get().strip(),
+            "categories": selected,
+            "allow_dangerous": profile_edit_danger_var.get(),
+        }
+        save_profiles(profiles)
+        refresh_profile_selectors()
+        messagebox.showinfo("Profile Editor", f"Profile '{name}' saved.")
+
+    def delete_profile_editor() -> None:
+        name = profile_edit_name_var.get().strip()
+        if not name:
+            return
+        if name in profiles:
+            profiles.pop(name)
+            save_profiles(profiles)
+            refresh_profile_selectors()
+            messagebox.showinfo("Profile Editor", f"Profile '{name}' removed.")
+
     status_frame = ttk.Frame(scanner_tab)
     status_frame.pack(fill=tk.X, padx=16, pady=(0, 10))
     ttk.Label(status_frame, textvariable=summary_var).pack(anchor="w")
@@ -1192,6 +1377,197 @@ def launch_gui() -> None:
     ttk.Label(audit_frame, text="Audit HTTP endpoint (optional):").pack(anchor="w", pady=(6, 2))
     audit_endpoint_var = tk.StringVar(value=str(config.get("audit_http_endpoint", "")))
     tk.Entry(audit_frame, textvariable=audit_endpoint_var, width=70).pack(anchor="w")
+
+    sentinel_frame = ttk.Frame(settings_tab)
+    sentinel_frame.pack(fill=tk.X, padx=16, pady=(0, 12))
+    sentinel_enabled_var = tk.BooleanVar(value=bool(config.get("sentinel_enabled", False)))
+    tk.Checkbutton(
+        sentinel_frame,
+        text="Send audit events to Microsoft Sentinel (Log Analytics)",
+        variable=sentinel_enabled_var,
+        bg=panel_bg,
+    ).pack(anchor="w")
+    ttk.Label(sentinel_frame, text="Workspace ID:").pack(anchor="w", pady=(6, 2))
+    sentinel_workspace_var = tk.StringVar(value=str(config.get("sentinel_workspace_id", "")))
+    tk.Entry(sentinel_frame, textvariable=sentinel_workspace_var, width=50).pack(anchor="w")
+    ttk.Label(sentinel_frame, text="Shared Key:").pack(anchor="w", pady=(6, 2))
+    sentinel_key_var = tk.StringVar(value=str(config.get("sentinel_shared_key", "")))
+    tk.Entry(sentinel_frame, textvariable=sentinel_key_var, width=50, show="*").pack(anchor="w")
+    ttk.Label(sentinel_frame, text="Log Type:").pack(anchor="w", pady=(6, 2))
+    sentinel_log_type_var = tk.StringVar(value=str(config.get("sentinel_log_type", "CDriveCleanerAudit")))
+    tk.Entry(sentinel_frame, textvariable=sentinel_log_type_var, width=30).pack(anchor="w")
+    ttk.Label(sentinel_frame, text="Time field (optional):").pack(anchor="w", pady=(6, 2))
+    sentinel_time_var = tk.StringVar(value=str(config.get("sentinel_time_field", "timestamp")))
+    tk.Entry(sentinel_frame, textvariable=sentinel_time_var, width=30).pack(anchor="w")
+
+    profile_editor_frame = ttk.Frame(settings_tab)
+    profile_editor_frame.pack(fill=tk.X, padx=16, pady=(0, 12))
+    ttk.Label(profile_editor_frame, text="Profile editor", style="Muted.TLabel").pack(
+        anchor="w"
+    )
+
+    editor_row = ttk.Frame(profile_editor_frame)
+    editor_row.pack(fill=tk.X, pady=(6, 6))
+    ttk.Label(editor_row, text="Profile name:").pack(side=tk.LEFT)
+    profile_edit_name_var = tk.StringVar(value=default_profile)
+    ttk.Entry(editor_row, textvariable=profile_edit_name_var, width=16).pack(
+        side=tk.LEFT, padx=6
+    )
+    ttk.Label(editor_row, text="Label:").pack(side=tk.LEFT)
+    profile_edit_label_var = tk.StringVar(value=str(profiles.get(default_profile, {}).get("label", "")))
+    ttk.Entry(editor_row, textvariable=profile_edit_label_var, width=20).pack(
+        side=tk.LEFT, padx=6
+    )
+    ttk.Label(editor_row, text="Allow dangerous:").pack(side=tk.LEFT)
+    profile_edit_danger_var = tk.BooleanVar(
+        value=bool(profiles.get(default_profile, {}).get("allow_dangerous", False))
+    )
+    tk.Checkbutton(editor_row, variable=profile_edit_danger_var, bg=panel_bg).pack(
+        side=tk.LEFT, padx=6
+    )
+
+    editor_desc_row = ttk.Frame(profile_editor_frame)
+    editor_desc_row.pack(fill=tk.X, pady=(0, 6))
+    ttk.Label(editor_desc_row, text="Description:").pack(side=tk.LEFT)
+    profile_edit_desc_var = tk.StringVar(
+        value=str(profiles.get(default_profile, {}).get("description", ""))
+    )
+    ttk.Entry(editor_desc_row, textvariable=profile_edit_desc_var, width=60).pack(
+        side=tk.LEFT, padx=6
+    )
+
+    editor_categories_frame = ttk.Frame(profile_editor_frame)
+    editor_categories_frame.pack(fill=tk.BOTH, pady=(0, 6))
+    ttk.Label(editor_categories_frame, text="Categories:").pack(anchor="w")
+    category_list = tk.Listbox(
+        editor_categories_frame, selectmode=tk.MULTIPLE, height=6, exportselection=False
+    )
+    category_list.pack(fill=tk.X, pady=(4, 4))
+    category_options = [f"{CATEGORY_LABELS.get(cat, cat)} ({cat})" for cat in KNOWN_CATEGORIES]
+    for option in category_options:
+        category_list.insert(tk.END, option)
+
+    profile_editor_buttons = ttk.Frame(profile_editor_frame)
+    profile_editor_buttons.pack(fill=tk.X)
+    profile_select_combo = ttk.Combobox(
+        profile_editor_buttons,
+        values=profile_names,
+        state="readonly",
+        width=18,
+    )
+    profile_select_combo.set(default_profile)
+    profile_select_combo.pack(side=tk.LEFT)
+    ttk.Button(profile_editor_buttons, text="Load", command=lambda: load_profile_into_editor(profile_select_combo.get())).pack(
+        side=tk.LEFT, padx=6
+    )
+    ttk.Button(profile_editor_buttons, text="New", command=lambda: new_profile_editor()).pack(
+        side=tk.LEFT
+    )
+    ttk.Button(profile_editor_buttons, text="Save", command=lambda: save_profile_editor()).pack(
+        side=tk.LEFT, padx=6
+    )
+    ttk.Button(profile_editor_buttons, text="Delete", command=lambda: delete_profile_editor()).pack(
+        side=tk.LEFT
+    )
+
+    schedule_frame = ttk.Frame(settings_tab)
+    schedule_frame.pack(fill=tk.X, padx=16, pady=(0, 12))
+    ttk.Label(schedule_frame, text="Schedule wizard", style="Muted.TLabel").pack(
+        anchor="w"
+    )
+    schedule_row = ttk.Frame(schedule_frame)
+    schedule_row.pack(fill=tk.X, pady=(6, 4))
+    ttk.Label(schedule_row, text="Profile:").pack(side=tk.LEFT)
+    schedule_profile_var = tk.StringVar(value=default_profile)
+    schedule_profile_combo = ttk.Combobox(
+        schedule_row,
+        textvariable=schedule_profile_var,
+        values=profile_names,
+        state="readonly",
+        width=18,
+    )
+    schedule_profile_combo.pack(side=tk.LEFT, padx=6)
+    ttk.Label(schedule_row, text="Frequency:").pack(side=tk.LEFT)
+    schedule_freq_var = tk.StringVar(value="DAILY")
+    schedule_freq_combo = ttk.Combobox(
+        schedule_row,
+        textvariable=schedule_freq_var,
+        values=["DAILY", "WEEKLY"],
+        state="readonly",
+        width=8,
+    )
+    schedule_freq_combo.pack(side=tk.LEFT, padx=6)
+    ttk.Label(schedule_row, text="Time:").pack(side=tk.LEFT)
+    schedule_time_var = tk.StringVar(value="02:00")
+    ttk.Entry(schedule_row, textvariable=schedule_time_var, width=8).pack(
+        side=tk.LEFT, padx=6
+    )
+    ttk.Label(schedule_row, text="Days (weekly):").pack(side=tk.LEFT)
+    schedule_days_var = tk.StringVar(value="MON")
+    ttk.Entry(schedule_row, textvariable=schedule_days_var, width=12).pack(
+        side=tk.LEFT, padx=6
+    )
+    ttk.Label(schedule_row, text="Run level:").pack(side=tk.LEFT)
+    schedule_runlevel_var = tk.StringVar(value="LIMITED")
+    schedule_runlevel_combo = ttk.Combobox(
+        schedule_row,
+        textvariable=schedule_runlevel_var,
+        values=["LIMITED", "HIGHEST"],
+        state="readonly",
+        width=9,
+    )
+    schedule_runlevel_combo.pack(side=tk.LEFT, padx=6)
+
+    schedule_output = tk.Text(schedule_frame, height=4)
+    schedule_output.pack(fill=tk.X, pady=(4, 6))
+
+    def schedule_task_name() -> str:
+        profile_name = schedule_profile_var.get() or "enterprise"
+        return f"CDriveCleaner - {profile_name}"
+
+    def schedule_log(output: str) -> None:
+        schedule_output.delete("1.0", tk.END)
+        schedule_output.insert(tk.END, output.strip() + "\n")
+
+    def schedule_create_action() -> None:
+        days = [d.strip().upper() for d in schedule_days_var.get().split(",") if d.strip()]
+        output = schedule_create(
+            name=schedule_task_name(),
+            profile=schedule_profile_var.get(),
+            frequency=schedule_freq_var.get(),
+            time_of_day=schedule_time_var.get(),
+            days=days or None,
+            run_level=schedule_runlevel_var.get(),
+        )
+        schedule_log(output)
+
+    def schedule_run_action() -> None:
+        schedule_log(schedule_run(schedule_task_name()))
+
+    def schedule_delete_action() -> None:
+        schedule_log(schedule_delete(schedule_task_name()))
+
+    def schedule_list_action() -> None:
+        tasks = schedule_list()
+        schedule_log("\n".join(tasks) if tasks else "No schedules found.")
+
+    schedule_buttons = ttk.Frame(schedule_frame)
+    schedule_buttons.pack(fill=tk.X)
+    ttk.Button(schedule_buttons, text="Create", command=schedule_create_action).pack(
+        side=tk.LEFT
+    )
+    ttk.Button(schedule_buttons, text="Run Now", command=schedule_run_action).pack(
+        side=tk.LEFT, padx=6
+    )
+    ttk.Button(schedule_buttons, text="Delete", command=schedule_delete_action).pack(
+        side=tk.LEFT
+    )
+    ttk.Button(schedule_buttons, text="List", command=schedule_list_action).pack(
+        side=tk.LEFT, padx=6
+    )
+
+    refresh_profile_selectors()
+    load_profile_into_editor(profile_select_combo.get())
 
     treemap_header = ttk.Label(
         treemap_tab,
@@ -1541,6 +1917,11 @@ def launch_gui() -> None:
             "audit_enabled": audit_enabled_var.get(),
             "audit_sink_path": audit_sink_var.get(),
             "audit_http_endpoint": audit_endpoint_var.get(),
+            "sentinel_enabled": sentinel_enabled_var.get(),
+            "sentinel_workspace_id": sentinel_workspace_var.get(),
+            "sentinel_shared_key": sentinel_key_var.get(),
+            "sentinel_log_type": sentinel_log_type_var.get(),
+            "sentinel_time_field": sentinel_time_var.get(),
         }
         save_config(config_update)
         messagebox.showinfo("Cleaner", "Settings saved.")

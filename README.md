@@ -11,6 +11,7 @@ visualizer (TreeSize-style), and a CLI for automation and reporting.
 - Policy profiles (enterprise presets) for standardized cleanup.
 - Scheduled cleanups via Windows Task Scheduler.
 - Centralized audit reporting (JSONL log + optional sink/HTTP endpoint).
+- Microsoft Sentinel / Log Analytics export (Data Collector API).
 - Full drive scan to surface large folders, with configurable size threshold.
 - Tree Map visualization with click-to-zoom and Back navigation.
 - Safe vs. Review guardrails to prevent accidental deletion of system/index data.
@@ -24,6 +25,7 @@ visualizer (TreeSize-style), and a CLI for automation and reporting.
 - Scanner tab: run targeted scan and optionally include full drive scan.
 - Results tab: review targets, open paths, export report, clean SAFE items.
 - Settings tab: skip list and scan thresholds.
+- Settings tab also includes profile editor, schedule wizard, and audit/Sentinel configuration.
 - Tree Map tab: visual breakdown by size with drill-down navigation.
 
 ## Screenshots
@@ -110,6 +112,16 @@ python cleaner.py clean --confirm --profile enterprise --audit-sink \\server\sha
 python cleaner.py clean --confirm --profile enterprise --audit-endpoint https://example.com/cleaner/audit
 python cleaner.py audit --export C:\temp\audit.json
 ```
+
+## Microsoft Sentinel / Log Analytics export
+
+Enable Sentinel export in Settings and provide:
+
+- Workspace ID
+- Shared Key
+- Log Type (letters only, e.g. `CDriveCleanerAudit`)
+
+The app will send each audit event to Log Analytics using the Data Collector API.
 
 ## Notes
 
