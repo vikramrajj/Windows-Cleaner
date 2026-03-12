@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*" Name="C Drive Cleaner" Language="1033" Version="1.0.0" Manufacturer="CDriveCleaner" UpgradeCode="B5F5D5A7-4A1B-4D0B-A05E-3F55A5F1E0A4">
+    <Package InstallerVersion="500" Compressed="yes" InstallScope="perUser" />
+    <MajorUpgrade DowngradeErrorMessage="A newer version of C Drive Cleaner is already installed." />
+    <MediaTemplate />
+
+    <Property Id="ARPPRODUCTICON" Value="AppIcon.ico" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="LocalAppDataFolder">
+        <Directory Id="INSTALLFOLDER" Name="C Drive Cleaner">
+          <Component Id="AppExe" Guid="A8B8E5D9-7C9C-4D95-9F7A-90C70A7BBE0E">
+            <File Id="CDriveCleanerExe" Source="..\dist\CDriveCleaner.exe" />
+            <File Id="AppIcon" Source="..\assets\app.ico" />
+            <RegistryValue Root="HKCU" Key="Software\CDriveCleaner" Name="InstallDir" Value="[INSTALLFOLDER]" Type="string" KeyPath="yes" />
+            <RemoveFolder Id="RemoveInstallFolder" Directory="INSTALLFOLDER" On="uninstall" />
+          </Component>
+        </Directory>
+      </Directory>
+      <Directory Id="ProgramMenuFolder" Name="Programs">
+        <Directory Id="AppMenuFolder" Name="C Drive Cleaner">
+          <Component Id="AppShortcut" Guid="B0C4A2F8-2D83-4B45-8B68-96C5A18E1A9C">
+            <Shortcut Id="StartMenuShortcut"
+                      Name="C Drive Cleaner"
+                      Target="[INSTALLFOLDER]CDriveCleaner.exe"
+                      WorkingDirectory="INSTALLFOLDER"
+                      Icon="AppIcon.ico"
+                      IconIndex="0"
+                      Advertise="no"
+                      Description="C Drive Cleaner" />
+            <RemoveFolder Id="RemoveAppMenuFolder" On="uninstall" />
+            <RegistryValue Root="HKCU" Key="Software\CDriveCleaner" Name="Shortcut" Value="1" Type="integer" KeyPath="yes" />
+          </Component>
+        </Directory>
+      </Directory>
+    </Directory>
+
+    <Feature Id="MainFeature" Title="C Drive Cleaner" Level="1">
+      <ComponentRef Id="AppExe" />
+      <ComponentRef Id="AppShortcut" />
+    </Feature>
+
+    <Icon Id="AppIcon.ico" SourceFile="..\assets\app.ico" />
+  </Product>
+</Wix>
