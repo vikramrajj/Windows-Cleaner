@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 import argparse
+import csv
+import getpass
 import json
 import os
+import platform
 import queue
 import shutil
 import sys
 import threading
 import time
+import uuid
 from dataclasses import dataclass, asdict, field
 from datetime import datetime
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -49,6 +53,8 @@ SAFE_DELETE_CATEGORIES = {
     "delivery_optimization_cache",
 }
 
+APP_VERSION = "1.2.0"
+
 ADMIN_REQUIRED_CATEGORIES = {
     "windows_update_cache",
     "delivery_optimization_cache",
@@ -68,6 +74,52 @@ ONE_CLICK_CATEGORIES = {
     "office_document_cache",
     "windows_update_cache",
     "delivery_optimization_cache",
+}
+
+BUILTIN_PROFILES: Dict[str, Dict[str, object]] = {
+    "standard": {
+        "label": "Standard",
+        "description": "Temp + Teams + Outlook secure temp.",
+        "categories": [
+            "temp_system",
+            "temp_user",
+            "teams_classic_cache",
+            "teams_new_cache",
+            "outlook_secure_temp",
+        ],
+        "allow_dangerous": False,
+    },
+    "enterprise": {
+        "label": "Enterprise",
+        "description": "Temp + Teams + Outlook + Office + Windows Update + Delivery Optimization.",
+        "categories": [
+            "temp_system",
+            "temp_user",
+            "teams_classic_cache",
+            "teams_new_cache",
+            "outlook_secure_temp",
+            "office_document_cache",
+            "windows_update_cache",
+            "delivery_optimization_cache",
+        ],
+        "allow_dangerous": False,
+    },
+    "aggressive": {
+        "label": "Aggressive",
+        "description": "Enterprise profile plus Windows Search Index.",
+        "categories": [
+            "temp_system",
+            "temp_user",
+            "teams_classic_cache",
+            "teams_new_cache",
+            "outlook_secure_temp",
+            "office_document_cache",
+            "windows_update_cache",
+            "delivery_optimization_cache",
+            "windows_search_index",
+        ],
+        "allow_dangerous": True,
+    },
 }
 
 
@@ -110,6 +162,10 @@ def load_config() -> Dict[str, object]:
         "min_full_scan_mb": 100,
         "skip_dirs": DEFAULT_SKIP_DIRS,
         "aggressive_full_scan": False,
+        "policy_profile": "enterprise",
+        "audit_enabled": True,
+        "audit_sink_path": "",
+        "audit_http_endpoint": "",
     }
     try:
         with open(config_path(), "r", encoding="utf-8") as handle:
@@ -121,12 +177,47 @@ def load_config() -> Dict[str, object]:
     return defaults
 
 
+def load_profiles() -> Dict[str, Dict[str, object]]:
+    profiles = {name: dict(value) for name, value in BUILTIN_PROFILES.items()}
+    custom_path = os.environ.get("CLEANER_PROFILES_PATH", "")
+    if not custom_path:
+        custom_path = os.path.join(app_data_dir(), "profiles.json")
+    if os.path.isfile(custom_path):
+        try:
+            with open(custom_path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            if isinstance(data, dict):
+                for name, profile in data.items():
+                    if isinstance(profile, dict):
+                        profiles[name] = profile
+        except Exception:
+            pass
+    return profiles
+
+
+def get_profile(name: str, profiles: Dict[str, Dict[str, object]]) -> Dict[str, object]:
+    if name in profiles:
+        return profiles[name]
+    return profiles.get("enterprise", BUILTIN_PROFILES["enterprise"])
+
+
+def profile_categories(profile: Dict[str, object]) -> List[str]:
+    categories = profile.get("categories", [])
+    if isinstance(categories, list):
+        return [str(item) for item in categories]
+    return []
+
+
 def save_config(config: Dict[str, object]) -> None:
     try:
         with open(config_path(), "w", encoding="utf-8") as handle:
             json.dump(config, handle, indent=2)
     except Exception:
         return
+
+
+def audit_log_path() -> str:
+    return os.path.join(app_data_dir(), "audit.jsonl")
 
 
 def is_admin() -> bool:
@@ -169,6 +260,195 @@ def subprocess_run(command: List[str]) -> str:
         return (result.stdout or "") + (result.stderr or "")
     except Exception:
         return ""
+
+
+def quote_arg(value: str) -> str:
+    if any(ch in value for ch in [" ", "\""]):
+        escaped = value.replace("\"", "\\\"")
+        return f"\"{escaped}\""
+    return value
+
+
+def build_task_command(args: List[str]) -> str:
+    if getattr(sys, "frozen", False):
+        exe = sys.executable
+        return " ".join([quote_arg(exe)] + [quote_arg(arg) for arg in args])
+    script = os.path.abspath(__file__)
+    return " ".join([quote_arg(sys.executable), quote_arg(script)] + [quote_arg(arg) for arg in args])
+
+
+def schedule_create(
+    name: str,
+    profile: str,
+    frequency: str,
+    time_of_day: str,
+    days: Optional[List[str]] = None,
+    run_level: str = "LIMITED",
+) -> str:
+    command = build_task_command(["clean", "--confirm", "--profile", profile])
+    args = [
+        "schtasks",
+        "/Create",
+        "/TN",
+        name,
+        "/TR",
+        command,
+        "/SC",
+        frequency.upper(),
+        "/ST",
+        time_of_day,
+        "/F",
+        "/RL",
+        run_level.upper(),
+    ]
+    if frequency.upper() == "WEEKLY" and days:
+        args.extend(["/D", ",".join(days)])
+    return subprocess_run(args)
+
+
+def schedule_delete(name: str) -> str:
+    return subprocess_run(["schtasks", "/Delete", "/TN", name, "/F"])
+
+
+def schedule_run(name: str) -> str:
+    return subprocess_run(["schtasks", "/Run", "/TN", name])
+
+
+def schedule_query(name: str) -> str:
+    return subprocess_run(["schtasks", "/Query", "/TN", name, "/V", "/FO", "LIST"])
+
+
+def schedule_list(prefix: str = "CDriveCleaner") -> List[str]:
+    output = subprocess_run(["schtasks", "/Query", "/FO", "LIST"])
+    tasks: List[str] = []
+    for line in output.splitlines():
+        if line.startswith("TaskName:"):
+            task_name = line.split(":", 1)[-1].strip()
+            if prefix in task_name:
+                tasks.append(task_name)
+    return tasks
+
+
+def get_audit_config(
+    overrides: Optional[Dict[str, Optional[str]]] = None,
+) -> Dict[str, Optional[str]]:
+    config = load_config()
+    sink = os.environ.get("CLEANER_AUDIT_SINK") or str(
+        config.get("audit_sink_path", "")
+    )
+    endpoint = os.environ.get("CLEANER_AUDIT_ENDPOINT") or str(
+        config.get("audit_http_endpoint", "")
+    )
+    enabled = bool(config.get("audit_enabled", True))
+    if overrides:
+        sink = overrides.get("sink", sink) or sink
+        endpoint = overrides.get("endpoint", endpoint) or endpoint
+        enabled = overrides.get("enabled", enabled) if overrides.get("enabled") is not None else enabled
+    return {"sink": sink, "endpoint": endpoint, "enabled": enabled}
+
+
+def build_audit_event(
+    action: str,
+    profile: str,
+    categories: List[str],
+    deleted_bytes: int,
+    deleted_files: int,
+    failures: List[str],
+    skipped: List[str],
+) -> Dict[str, object]:
+    return {
+        "event_id": str(uuid.uuid4()),
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "host": platform.node(),
+        "user": getpass.getuser(),
+        "admin": is_admin(),
+        "app_version": APP_VERSION,
+        "action": action,
+        "profile": profile,
+        "categories": categories,
+        "deleted_bytes": deleted_bytes,
+        "deleted_files": deleted_files,
+        "failures": failures[:50],
+        "skipped": skipped[:50],
+    }
+
+
+def write_audit_event(event: Dict[str, object], sink: str = "", endpoint: str = "") -> None:
+    try:
+        with open(audit_log_path(), "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event) + "\n")
+    except Exception:
+        pass
+
+    if sink:
+        try:
+            os.makedirs(os.path.dirname(sink), exist_ok=True)
+            with open(sink, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(event) + "\n")
+        except Exception as exc:
+            log_event(f"Audit sink write failed: {exc}")
+
+    if endpoint:
+        try:
+            import urllib.request
+
+            data = json.dumps(event).encode("utf-8")
+            req = urllib.request.Request(
+                endpoint,
+                data=data,
+                headers={"Content-Type": "application/json"},
+            )
+            urllib.request.urlopen(req, timeout=10)
+        except Exception as exc:
+            log_event(f"Audit endpoint send failed: {exc}")
+
+
+def read_audit_events() -> List[Dict[str, object]]:
+    events: List[Dict[str, object]] = []
+    try:
+        with open(audit_log_path(), "r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                    if isinstance(event, dict):
+                        events.append(event)
+                except Exception:
+                    continue
+    except Exception:
+        return events
+    return events
+
+
+def emit_audit_event(
+    action: str,
+    profile: str,
+    categories: List[str],
+    deleted_bytes: int,
+    deleted_files: int,
+    failures: List[str],
+    skipped: List[str],
+    audit_overrides: Optional[Dict[str, Optional[str]]] = None,
+) -> None:
+    audit_config = get_audit_config(audit_overrides)
+    if not audit_config.get("enabled", True):
+        return
+    event = build_audit_event(
+        action=action,
+        profile=profile,
+        categories=categories,
+        deleted_bytes=deleted_bytes,
+        deleted_files=deleted_files,
+        failures=failures,
+        skipped=skipped,
+    )
+    write_audit_event(
+        event,
+        sink=audit_config.get("sink") or "",
+        endpoint=audit_config.get("endpoint") or "",
+    )
 
 
 def human_bytes(value: int) -> str:
@@ -666,9 +946,13 @@ def clean_items(
     return deleted_bytes, deleted_files, failures
 
 
-def one_click_clean(items: List[ScanItem]) -> Tuple[int, int, List[str], List[str]]:
+def clean_by_categories(
+    items: List[ScanItem],
+    categories: List[str],
+    allow_dangerous: bool = False,
+) -> Tuple[int, int, List[str], List[str]]:
     skipped: List[str] = []
-    candidates = [item for item in items if item.category in ONE_CLICK_CATEGORIES]
+    candidates = [item for item in items if item.category in categories]
     admin = is_admin()
 
     services = []
@@ -686,12 +970,18 @@ def one_click_clean(items: List[ScanItem]) -> Tuple[int, int, List[str], List[st
         for item in candidates
         if (not item.requires_admin) or (item.requires_admin and admin)
     ]
-    deleted_bytes, deleted_files, failures = clean_items(cleanable)
+    deleted_bytes, deleted_files, failures = clean_items(
+        cleanable, allow_dangerous=allow_dangerous
+    )
 
     if stopped:
         start_services(stopped)
 
     return deleted_bytes, deleted_files, failures, skipped
+
+
+def one_click_clean(items: List[ScanItem]) -> Tuple[int, int, List[str], List[str]]:
+    return clean_by_categories(items, list(ONE_CLICK_CATEGORIES))
 
 
 def save_scan_cache(items: List[ScanItem]) -> None:
@@ -724,6 +1014,7 @@ def launch_gui() -> None:
     root.configure(bg="#f6f7fb")
 
     config = load_config()
+    profiles = load_profiles()
     items: List[ScanItem] = load_scan_cache()
     progress_queue: "queue.Queue" = queue.Queue()
 
@@ -810,6 +1101,15 @@ def launch_gui() -> None:
     aggressive_var = tk.BooleanVar(value=bool(config.get("aggressive_full_scan")))
     min_mb_var = tk.StringVar(value=str(config.get("min_full_scan_mb", 100)))
 
+    profile_names = sorted(profiles.keys())
+    default_profile = str(config.get("policy_profile", "enterprise"))
+    if default_profile not in profiles:
+        default_profile = "enterprise"
+    profile_var = tk.StringVar(value=default_profile)
+    profile_desc_var = tk.StringVar(
+        value=str(profiles.get(default_profile, {}).get("description", ""))
+    )
+
     options_frame = ttk.Frame(scanner_tab)
     options_frame.pack(fill=tk.X, padx=16, pady=6)
     tk.Checkbutton(
@@ -826,6 +1126,27 @@ def launch_gui() -> None:
     ).pack(side=tk.LEFT, padx=12)
     ttk.Label(options_frame, text="Min size (MB):").pack(side=tk.LEFT, padx=(12, 6))
     tk.Entry(options_frame, textvariable=min_mb_var, width=6).pack(side=tk.LEFT)
+
+    profile_frame = ttk.Frame(scanner_tab)
+    profile_frame.pack(fill=tk.X, padx=16, pady=(4, 10))
+    ttk.Label(profile_frame, text="Policy profile:").pack(side=tk.LEFT)
+    profile_combo = ttk.Combobox(
+        profile_frame,
+        textvariable=profile_var,
+        values=profile_names,
+        state="readonly",
+        width=18,
+    )
+    profile_combo.pack(side=tk.LEFT, padx=8)
+    profile_desc = ttk.Label(profile_frame, textvariable=profile_desc_var, style="Muted.TLabel")
+    profile_desc.pack(side=tk.LEFT, padx=8)
+
+    def on_profile_change(event: Optional[tk.Event] = None) -> None:
+        name = profile_var.get()
+        profile = get_profile(name, profiles)
+        profile_desc_var.set(str(profile.get("description", "")))
+
+    profile_combo.bind("<<ComboboxSelected>>", on_profile_change)
 
     status_frame = ttk.Frame(scanner_tab)
     status_frame.pack(fill=tk.X, padx=16, pady=(0, 10))
@@ -855,6 +1176,22 @@ def launch_gui() -> None:
     skip_text = tk.Text(settings_tab, height=10)
     skip_text.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 12))
     skip_text.insert("1.0", "\n".join(config.get("skip_dirs", DEFAULT_SKIP_DIRS)))
+
+    audit_frame = ttk.Frame(settings_tab)
+    audit_frame.pack(fill=tk.X, padx=16, pady=(0, 12))
+    audit_enabled_var = tk.BooleanVar(value=bool(config.get("audit_enabled", True)))
+    tk.Checkbutton(
+        audit_frame,
+        text="Enable audit logging",
+        variable=audit_enabled_var,
+        bg=panel_bg,
+    ).pack(anchor="w")
+    ttk.Label(audit_frame, text="Audit sink path (optional):").pack(anchor="w", pady=(6, 2))
+    audit_sink_var = tk.StringVar(value=str(config.get("audit_sink_path", "")))
+    tk.Entry(audit_frame, textvariable=audit_sink_var, width=70).pack(anchor="w")
+    ttk.Label(audit_frame, text="Audit HTTP endpoint (optional):").pack(anchor="w", pady=(6, 2))
+    audit_endpoint_var = tk.StringVar(value=str(config.get("audit_http_endpoint", "")))
+    tk.Entry(audit_frame, textvariable=audit_endpoint_var, width=70).pack(anchor="w")
 
     treemap_header = ttk.Label(
         treemap_tab,
@@ -997,17 +1334,34 @@ def launch_gui() -> None:
     def run_one_click() -> None:
         def worker() -> None:
             nonlocal items
+            profile_name = profile_var.get() or "enterprise"
+            profile = get_profile(profile_name, profiles)
+            categories = profile_categories(profile) or list(ONE_CLICK_CATEGORIES)
+            allow_dangerous = bool(profile.get("allow_dangerous", False))
             ok = messagebox.askyesno(
                 "One Click Clean",
-                "Clean Windows Update, Delivery Optimization, Office/Outlook/Teams caches, and temp files?",
+                f"Run the '{profile_name}' policy profile?",
             )
             if not ok:
                 return
             summary_var.set("Running one-click cleanup...")
             progress_var.set("")
             items = scan_rules()
-            deleted_bytes, deleted_files, failures, skipped = one_click_clean(items)
-            summary = f"One-click cleanup removed {deleted_files} items ({human_bytes(deleted_bytes)})."
+            deleted_bytes, deleted_files, failures, skipped = clean_by_categories(
+                items, categories, allow_dangerous=allow_dangerous
+            )
+            emit_audit_event(
+                action="profile_clean",
+                profile=profile_name,
+                categories=categories,
+                deleted_bytes=deleted_bytes,
+                deleted_files=deleted_files,
+                failures=failures,
+                skipped=skipped,
+            )
+            summary = (
+                f"Profile '{profile_name}' removed {deleted_files} items ({human_bytes(deleted_bytes)})."
+            )
             if skipped:
                 summary += "\nSome items require admin rights."
             if failures:
@@ -1150,6 +1504,15 @@ def launch_gui() -> None:
         if not ok:
             return
         deleted_bytes, deleted_files, failures = clean_items(chosen)
+        emit_audit_event(
+            action="manual_clean",
+            profile="manual",
+            categories=[item.category for item in chosen],
+            deleted_bytes=deleted_bytes,
+            deleted_files=deleted_files,
+            failures=failures,
+            skipped=[],
+        )
         log_event(
             f"Cleaned {deleted_files} entries totaling {deleted_bytes} bytes; failures={len(failures)}"
         )
@@ -1174,6 +1537,10 @@ def launch_gui() -> None:
                 if line.strip()
             ],
             "aggressive_full_scan": aggressive_var.get(),
+            "policy_profile": profile_var.get(),
+            "audit_enabled": audit_enabled_var.get(),
+            "audit_sink_path": audit_sink_var.get(),
+            "audit_http_endpoint": audit_endpoint_var.get(),
         }
         save_config(config_update)
         messagebox.showinfo("Cleaner", "Settings saved.")
@@ -1265,6 +1632,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="Limit to specific category (repeatable).",
     )
     clean_cmd.add_argument(
+        "--profile",
+        help="Use a policy profile (see profiles list).",
+    )
+    clean_cmd.add_argument(
         "--confirm",
         action="store_true",
         help="Required to perform deletion.",
@@ -1278,6 +1649,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--one-click",
         action="store_true",
         help="Run the one-click cleanup set.",
+    )
+    clean_cmd.add_argument(
+        "--audit-sink",
+        help="Write audit events to an additional JSONL path (e.g., UNC share).",
+    )
+    clean_cmd.add_argument(
+        "--audit-endpoint",
+        help="Send audit events to an HTTP endpoint.",
+    )
+    clean_cmd.add_argument(
+        "--audit-disable",
+        action="store_true",
+        help="Disable audit events for this run.",
     )
     clean_cmd.add_argument(
         "--dry-run",
@@ -1301,6 +1685,35 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     sub.add_parser("gui", help="Launch the UI.")
 
+    profiles_cmd = sub.add_parser("profiles", help="List or export policy profiles.")
+    profiles_cmd.add_argument("--list", action="store_true", help="List profiles.")
+    profiles_cmd.add_argument("--show", help="Show a profile by name.")
+    profiles_cmd.add_argument("--export", help="Export profiles to JSON.")
+
+    schedule_cmd = sub.add_parser("schedule", help="Manage scheduled cleanups.")
+    schedule_cmd.add_argument("--create", action="store_true", help="Create a schedule.")
+    schedule_cmd.add_argument("--delete", action="store_true", help="Delete a schedule.")
+    schedule_cmd.add_argument("--run-now", action="store_true", help="Run a schedule now.")
+    schedule_cmd.add_argument("--list", action="store_true", help="List schedules.")
+    schedule_cmd.add_argument("--name", help="Task name (default uses profile).")
+    schedule_cmd.add_argument("--profile", default="enterprise", help="Profile to run.")
+    schedule_cmd.add_argument("--freq", default="DAILY", help="DAILY or WEEKLY.")
+    schedule_cmd.add_argument("--time", default="02:00", help="Start time (HH:MM).")
+    schedule_cmd.add_argument("--days", help="Weekly days, e.g. MON,TUE.")
+    schedule_cmd.add_argument(
+        "--run-level", default="LIMITED", help="LIMITED or HIGHEST."
+    )
+
+    audit_cmd = sub.add_parser("audit", help="Export or push audit logs.")
+    audit_cmd.add_argument("--export", help="Export audit log to a file.")
+    audit_cmd.add_argument(
+        "--format",
+        default="jsonl",
+        choices=["jsonl", "json", "csv"],
+        help="Export format.",
+    )
+    audit_cmd.add_argument("--push", help="Push audit log to an HTTP endpoint.")
+
     args = parser.parse_args(argv)
 
     if args.command == "gui":
@@ -1308,6 +1721,83 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     config = load_config()
+    profiles = load_profiles()
+
+    if args.command == "profiles":
+        if args.export:
+            with open(args.export, "w", encoding="utf-8") as handle:
+                json.dump(profiles, handle, indent=2)
+            print(f"Profiles exported to {args.export}")
+            return 0
+        if args.show:
+            profile = get_profile(args.show, profiles)
+            print(json.dumps(profile, indent=2))
+            return 0
+        for name in sorted(profiles.keys()):
+            profile = profiles[name]
+            label = profile.get("label", name)
+            desc = profile.get("description", "")
+            print(f"- {name}: {label} {('- ' + desc) if desc else ''}")
+        return 0
+
+    if args.command == "schedule":
+        profile_name = args.profile or "enterprise"
+        task_name = args.name or f"CDriveCleaner - {profile_name}"
+        if args.list:
+            tasks = schedule_list()
+            if tasks:
+                for task in tasks:
+                    print(task)
+            else:
+                print("No schedules found.")
+            return 0
+        if args.delete:
+            print(schedule_delete(task_name))
+            return 0
+        if args.run_now:
+            print(schedule_run(task_name))
+            return 0
+        if args.create:
+            days = [d.strip().upper() for d in (args.days or "").split(",") if d.strip()]
+            output = schedule_create(
+                name=task_name,
+                profile=profile_name,
+                frequency=str(args.freq).upper(),
+                time_of_day=args.time,
+                days=days or None,
+                run_level=str(args.run_level).upper(),
+            )
+            print(output)
+            return 0
+        print(schedule_query(task_name))
+        return 0
+
+    if args.command == "audit":
+        events = read_audit_events()
+        if args.export:
+            if args.format == "jsonl":
+                with open(args.export, "w", encoding="utf-8") as handle:
+                    for event in events:
+                        handle.write(json.dumps(event) + "\n")
+            elif args.format == "json":
+                with open(args.export, "w", encoding="utf-8") as handle:
+                    json.dump(events, handle, indent=2)
+            else:
+                if events:
+                    with open(args.export, "w", encoding="utf-8", newline="") as handle:
+                        writer = csv.DictWriter(handle, fieldnames=sorted(events[0].keys()))
+                        writer.writeheader()
+                        writer.writerows(events)
+            print(f"Audit exported to {args.export}")
+            return 0
+        if args.push:
+            for event in events:
+                write_audit_event(event, sink="", endpoint=args.push)
+            print(f"Audit pushed to {args.push}")
+            return 0
+        print(f"{len(events)} audit events found.")
+        return 0
+
     items = scan_rules()
     if args.command in {"scan", "report"} and args.full:
         min_mb = args.min_mb if args.min_mb is not None else int(
@@ -1353,8 +1843,52 @@ def main(argv: Optional[List[str]] = None) -> int:
         if not args.confirm:
             print("Refusing to delete without --confirm.")
             return 2
+        audit_overrides = {
+            "sink": args.audit_sink,
+            "endpoint": args.audit_endpoint,
+            "enabled": False if args.audit_disable else None,
+        }
+        if args.profile:
+            profile = get_profile(args.profile, profiles)
+            categories = profile_categories(profile)
+            allow_dangerous = bool(profile.get("allow_dangerous", False)) or args.dangerous
+            deleted_bytes, deleted_files, failures, skipped = clean_by_categories(
+                items, categories, allow_dangerous=allow_dangerous
+            )
+            emit_audit_event(
+                action="profile_clean",
+                profile=args.profile,
+                categories=categories,
+                deleted_bytes=deleted_bytes,
+                deleted_files=deleted_files,
+                failures=failures,
+                skipped=skipped,
+                audit_overrides=audit_overrides,
+            )
+            print(
+                f"Profile '{args.profile}' removed {deleted_files} entries totaling {human_bytes(deleted_bytes)}."
+            )
+            if skipped:
+                print("Skipped (admin required):")
+                for item in skipped:
+                    print(f"- {item}")
+            if failures:
+                print("Failures:")
+                for fail in failures:
+                    print(f"- {fail}")
+            return 0
         if args.one_click:
             deleted_bytes, deleted_files, failures, skipped = one_click_clean(items)
+            emit_audit_event(
+                action="one_click",
+                profile="one_click",
+                categories=list(ONE_CLICK_CATEGORIES),
+                deleted_bytes=deleted_bytes,
+                deleted_files=deleted_files,
+                failures=failures,
+                skipped=skipped,
+                audit_overrides=audit_overrides,
+            )
             print(
                 f"One-click cleanup removed {deleted_files} entries totaling {human_bytes(deleted_bytes)}."
             )
@@ -1374,6 +1908,16 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 0
         deleted_bytes, deleted_files, failures = clean_items(
             items, allow_dangerous=args.dangerous
+        )
+        emit_audit_event(
+            action="manual_clean",
+            profile="manual",
+            categories=[item.category for item in items],
+            deleted_bytes=deleted_bytes,
+            deleted_files=deleted_files,
+            failures=failures,
+            skipped=[],
+            audit_overrides=audit_overrides,
         )
         print(
             f"Deleted {deleted_files} entries totaling {human_bytes(deleted_bytes)}."

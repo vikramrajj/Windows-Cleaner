@@ -8,6 +8,9 @@ visualizer (TreeSize-style), and a CLI for automation and reporting.
 
 - Targeted cache cleaning: Teams classic/new, Outlook Secure Temp, Office document cache, Windows temp, user temp.
 - Windows Update residuals and Delivery Optimization cache cleanup (admin required).
+- Policy profiles (enterprise presets) for standardized cleanup.
+- Scheduled cleanups via Windows Task Scheduler.
+- Centralized audit reporting (JSONL log + optional sink/HTTP endpoint).
 - Full drive scan to surface large folders, with configurable size threshold.
 - Tree Map visualization with click-to-zoom and Back navigation.
 - Safe vs. Review guardrails to prevent accidental deletion of system/index data.
@@ -44,8 +47,12 @@ python cleaner.py clean --confirm [--category temp_user --category teams_classic
 python cleaner.py clean --confirm --dangerous
 python cleaner.py clean --confirm --dry-run --use-last-scan
 python cleaner.py clean --confirm --one-click
+python cleaner.py clean --confirm --profile enterprise
 python cleaner.py report --path C:\temp\cleaner-report.txt [--full] [--aggressive]
 python cleaner.py gui
+python cleaner.py profiles --list
+python cleaner.py schedule --create --profile enterprise --freq DAILY --time 02:00
+python cleaner.py audit --export C:\temp\audit.jsonl
 ```
 
 ## Safety model
@@ -63,6 +70,46 @@ python cleaner.py clean --confirm --one-click
 ```
 
 Run as Administrator to include Windows Update and Delivery Optimization caches.
+
+## Policy profiles (enterprise presets)
+
+Profiles define which categories are cleaned in a single run:
+
+- `standard`: temp + Teams + Outlook secure temp
+- `enterprise`: standard + Office document cache + Windows Update + Delivery Optimization
+- `aggressive`: enterprise + Windows Search index
+
+Use:
+
+```powershell
+python cleaner.py clean --confirm --profile enterprise
+python cleaner.py profiles --list
+```
+
+## Scheduled cleanups
+
+Create a scheduled cleanup task using Task Scheduler:
+
+```powershell
+python cleaner.py schedule --create --profile enterprise --freq DAILY --time 02:00
+python cleaner.py schedule --list
+python cleaner.py schedule --run-now --name "CDriveCleaner - enterprise"
+python cleaner.py schedule --delete --name "CDriveCleaner - enterprise"
+```
+
+## Centralized audit reporting
+
+Audit events are written to:
+
+`%LOCALAPPDATA%\CDriveCleaner\audit.jsonl`
+
+Optional: add a sink path or HTTP endpoint in the Settings tab, or override via CLI:
+
+```powershell
+python cleaner.py clean --confirm --profile enterprise --audit-sink \\server\share\cleaner-audit.jsonl
+python cleaner.py clean --confirm --profile enterprise --audit-endpoint https://example.com/cleaner/audit
+python cleaner.py audit --export C:\temp\audit.json
+```
 
 ## Notes
 
