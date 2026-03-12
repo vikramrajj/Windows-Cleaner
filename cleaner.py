@@ -126,6 +126,69 @@ BUILTIN_PROFILES: Dict[str, Dict[str, object]] = {
     },
 }
 
+DEPARTMENT_TEMPLATES: Dict[str, Dict[str, object]] = {
+    "dept_it": {
+        "label": "IT Operations",
+        "description": "Enterprise cleanup + update caches (admin recommended).",
+        "categories": [
+            "temp_system",
+            "temp_user",
+            "teams_classic_cache",
+            "teams_new_cache",
+            "outlook_secure_temp",
+            "office_document_cache",
+            "windows_update_cache",
+            "delivery_optimization_cache",
+        ],
+        "allow_dangerous": False,
+    },
+    "dept_finance": {
+        "label": "Finance",
+        "description": "Conservative profile focused on Office/Outlook temp data.",
+        "categories": [
+            "temp_user",
+            "outlook_secure_temp",
+            "office_document_cache",
+            "teams_new_cache",
+        ],
+        "allow_dangerous": False,
+    },
+    "dept_marketing": {
+        "label": "Marketing",
+        "description": "Collaboration and temp cleanup for creative workflows.",
+        "categories": [
+            "temp_user",
+            "teams_new_cache",
+            "teams_classic_cache",
+            "outlook_secure_temp",
+            "office_document_cache",
+        ],
+        "allow_dangerous": False,
+    },
+    "dept_engineering": {
+        "label": "Engineering",
+        "description": "Balanced cleanup for dev machines and collaboration.",
+        "categories": [
+            "temp_system",
+            "temp_user",
+            "teams_new_cache",
+            "outlook_secure_temp",
+            "office_document_cache",
+        ],
+        "allow_dangerous": False,
+    },
+    "dept_executive": {
+        "label": "Executive",
+        "description": "Minimal, low-risk cleanup for executive devices.",
+        "categories": [
+            "temp_user",
+            "outlook_secure_temp",
+            "office_document_cache",
+        ],
+        "allow_dangerous": False,
+    },
+}
+
 KNOWN_CATEGORIES = [
     "temp_system",
     "temp_user",
@@ -212,6 +275,8 @@ def load_config() -> Dict[str, object]:
 
 def load_profiles() -> Dict[str, Dict[str, object]]:
     profiles = {name: dict(value) for name, value in BUILTIN_PROFILES.items()}
+    for name, profile in DEPARTMENT_TEMPLATES.items():
+        profiles.setdefault(name, dict(profile))
     custom_path = os.environ.get("CLEANER_PROFILES_PATH", "")
     if not custom_path:
         custom_path = os.path.join(app_data_dir(), "profiles.json")
@@ -1470,6 +1535,39 @@ def launch_gui() -> None:
         side=tk.LEFT
     )
 
+    template_frame = ttk.Frame(profile_editor_frame)
+    template_frame.pack(fill=tk.X, pady=(6, 0))
+    ttk.Label(template_frame, text="Department templates:").pack(side=tk.LEFT)
+    template_names = sorted(DEPARTMENT_TEMPLATES.keys())
+    template_select = ttk.Combobox(
+        template_frame,
+        values=template_names,
+        state="readonly",
+        width=20,
+    )
+    if template_names:
+        template_select.set(template_names[0])
+    template_select.pack(side=tk.LEFT, padx=6)
+
+    def load_template_into_editor() -> None:
+        name = template_select.get()
+        template = DEPARTMENT_TEMPLATES.get(name)
+        if not template:
+            return
+        profile_edit_name_var.set(name)
+        profile_edit_label_var.set(str(template.get("label", name)))
+        profile_edit_desc_var.set(str(template.get("description", "")))
+        profile_edit_danger_var.set(bool(template.get("allow_dangerous", False)))
+        category_list.selection_clear(0, tk.END)
+        categories = set(template.get("categories", []))
+        for idx, cat in enumerate(KNOWN_CATEGORIES):
+            if cat in categories:
+                category_list.selection_set(idx)
+
+    ttk.Button(template_frame, text="Load Template", command=load_template_into_editor).pack(
+        side=tk.LEFT
+    )
+
     schedule_frame = ttk.Frame(settings_tab)
     schedule_frame.pack(fill=tk.X, padx=16, pady=(0, 12))
     ttk.Label(schedule_frame, text="Schedule wizard", style="Muted.TLabel").pack(
@@ -1747,6 +1845,135 @@ def launch_gui() -> None:
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def open_guided_wizard() -> None:
+        wizard = tk.Toplevel(root)
+        wizard.title("Guided Cleanup")
+        wizard.geometry("520x360")
+        wizard.configure(bg=panel_bg)
+        wizard.transient(root)
+        wizard.grab_set()
+
+        step_index = tk.IntVar(value=0)
+
+        steps = [
+            {
+                "title": "Welcome",
+                "body": "We’ll guide you through a safe cleanup in a few steps.",
+                "action_label": "Open Scanner",
+                "action": lambda: notebook.select(scanner_tab),
+            },
+            {
+                "title": "Choose Profile",
+                "body": "Pick a policy profile that matches your device or department.",
+                "action_label": "Focus Profile",
+                "action": lambda: notebook.select(scanner_tab),
+            },
+            {
+                "title": "Run Scan",
+                "body": "Start a scan to estimate space you can recover.",
+                "action_label": "Start Scan",
+                "action": run_scan_in_background,
+            },
+            {
+                "title": "Review Results",
+                "body": "Open Results to review SAFE vs REVIEW items.",
+                "action_label": "Open Results",
+                "action": lambda: notebook.select(results_tab),
+            },
+            {
+                "title": "Clean",
+                "body": "Run the selected profile with One Click Clean.",
+                "action_label": "Run One Click",
+                "action": run_one_click,
+            },
+            {
+                "title": "Schedule (Optional)",
+                "body": "Set a schedule in Settings so cleanup runs automatically.",
+                "action_label": "Open Settings",
+                "action": lambda: notebook.select(settings_tab),
+            },
+            {
+                "title": "All set",
+                "body": "You’re done. You can rerun the wizard anytime.",
+                "action_label": None,
+                "action": None,
+            },
+        ]
+
+        header = tk.Frame(wizard, bg=brand_bg, height=64)
+        header.pack(fill=tk.X)
+        header.pack_propagate(False)
+        title_label = tk.Label(
+            header,
+            text="Guided Cleanup",
+            font=("Segoe UI Semibold", 14),
+            fg=brand_fg,
+            bg=brand_bg,
+        )
+        title_label.pack(anchor="w", padx=16, pady=16)
+
+        content = tk.Frame(wizard, bg=panel_bg)
+        content.pack(fill=tk.BOTH, expand=True, padx=16, pady=16)
+
+        step_title = tk.Label(content, text="", font=("Segoe UI Semibold", 13), bg=panel_bg, fg=text_primary)
+        step_title.pack(anchor="w")
+        step_body = tk.Label(
+            content,
+            text="",
+            font=("Segoe UI", 10),
+            bg=panel_bg,
+            fg=text_muted,
+            wraplength=460,
+            justify="left",
+        )
+        step_body.pack(anchor="w", pady=(8, 12))
+
+        action_btn = ttk.Button(content, text="")
+        action_btn.pack(anchor="w")
+
+        nav = tk.Frame(wizard, bg=panel_bg)
+        nav.pack(fill=tk.X, padx=16, pady=12)
+        back_btn = ttk.Button(nav, text="Back")
+        back_btn.pack(side=tk.LEFT)
+        next_btn = ttk.Button(nav, text="Next")
+        next_btn.pack(side=tk.LEFT, padx=8)
+        close_btn = ttk.Button(nav, text="Close", command=wizard.destroy)
+        close_btn.pack(side=tk.RIGHT)
+
+        def render_step() -> None:
+            idx = step_index.get()
+            step = steps[idx]
+            step_title.config(text=f"Step {idx + 1}: {step['title']}")
+            step_body.config(text=step["body"])
+            if step.get("action_label"):
+                action_btn.config(text=step["action_label"], state=tk.NORMAL)
+            else:
+                action_btn.config(text="Done", state=tk.DISABLED)
+            back_btn.config(state=tk.NORMAL if idx > 0 else tk.DISABLED)
+            next_btn.config(state=tk.NORMAL if idx < len(steps) - 1 else tk.DISABLED)
+
+        def run_action() -> None:
+            idx = step_index.get()
+            action = steps[idx].get("action")
+            if action:
+                action()
+
+        def next_step() -> None:
+            if step_index.get() < len(steps) - 1:
+                step_index.set(step_index.get() + 1)
+                render_step()
+
+        def prev_step() -> None:
+            if step_index.get() > 0:
+                step_index.set(step_index.get() - 1)
+                render_step()
+
+        action_btn.config(command=run_action)
+        next_btn.config(command=next_step)
+        back_btn.config(command=prev_step)
+
+        render_step()
+
     def draw_treemap(node: TreeNode) -> None:
         treemap_canvas.delete("all")
         treemap_rects.clear()
@@ -1938,6 +2165,11 @@ def launch_gui() -> None:
         scanner_buttons,
         text="One Click Clean",
         command=run_one_click,
+    ).pack(side=tk.LEFT, padx=8)
+    ttk.Button(
+        scanner_buttons,
+        text="Guided Cleanup",
+        command=open_guided_wizard,
     ).pack(side=tk.LEFT, padx=8)
     ttk.Button(scanner_buttons, text="Save Settings", command=save_settings).pack(
         side=tk.LEFT, padx=8

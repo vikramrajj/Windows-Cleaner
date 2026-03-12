@@ -12,6 +12,8 @@ visualizer (TreeSize-style), and a CLI for automation and reporting.
 - Scheduled cleanups via Windows Task Scheduler.
 - Centralized audit reporting (JSONL log + optional sink/HTTP endpoint).
 - Microsoft Sentinel / Log Analytics export (Data Collector API).
+- Guided Cleanup wizard (step-by-step).
+- Department templates for Finance, IT, Marketing, Engineering, Executive.
 - Full drive scan to surface large folders, with configurable size threshold.
 - Tree Map visualization with click-to-zoom and Back navigation.
 - Safe vs. Review guardrails to prevent accidental deletion of system/index data.
@@ -26,6 +28,7 @@ visualizer (TreeSize-style), and a CLI for automation and reporting.
 - Results tab: review targets, open paths, export report, clean SAFE items.
 - Settings tab: skip list and scan thresholds.
 - Settings tab also includes profile editor, schedule wizard, and audit/Sentinel configuration.
+- Scanner tab includes Guided Cleanup for beginners.
 - Tree Map tab: visual breakdown by size with drill-down navigation.
 
 ## Screenshots
@@ -80,6 +83,7 @@ Profiles define which categories are cleaned in a single run:
 - `standard`: temp + Teams + Outlook secure temp
 - `enterprise`: standard + Office document cache + Windows Update + Delivery Optimization
 - `aggressive`: enterprise + Windows Search index
+- `dept_it`, `dept_finance`, `dept_marketing`, `dept_engineering`, `dept_executive` (department templates)
 
 Use:
 
